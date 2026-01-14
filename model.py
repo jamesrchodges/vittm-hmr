@@ -1,119 +1,235 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
 
-class ProcessEncoder(nn.Module):
+class LinearCrossAttention(nn.Module):
     """
-    The 'Student': Sees coarse patches (64x64), learns to predict fine features.
+    O(N) Efficient Attention mechanism for the 'Read' operation.
+    Process Tokens (Query) attend to Memory Tokens (Key/Value).
+    
+    Formula: (elu(Q) + 1) @ ((elu(K) + 1).T @ V)
     """
-    def __init__(self, img_size=256, patch_size=64, embed_dim=384, depth=6, num_heads=6):
+    def __init__(self, dim, num_heads=8, qkv_bias=False):
         super().__init__()
-        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
         
-        # 256 / 64 = 4 -> 4x4 = 16 tokens
-        self.num_patches = (img_size // patch_size) ** 2
+        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.out_proj = nn.Linear(dim, dim)
+
+    def forward(self, x_query, x_key_value):
+        """
+        x_query: Process Tokens [B, N_proc, D]
+        x_key_value: Memory Tokens [B, N_mem, D]
+        """
+        B, N_q, D = x_query.shape
+        B, N_k, D = x_key_value.shape
         
-        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches, embed_dim) * .02)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # 1. Project Q, K, V
+        q = self.q_proj(x_query).reshape(B, N_q, self.num_heads, -1).permute(0, 2, 1, 3)
+        k = self.k_proj(x_key_value).reshape(B, N_k, self.num_heads, -1).permute(0, 2, 1, 3)
+        v = self.v_proj(x_key_value).reshape(B, N_k, self.num_heads, -1).permute(0, 2, 1, 3)
+
+        # 2. Kernel Trick (ELU + 1) for non-negative feature map
+        # This allows us to re-order multiplication: Q(K^T V) instead of (QK^T)V
+        q = F.elu(q) + 1.0
+        k = F.elu(k) + 1.0
+
+        # 3. Efficient Attention Aggregation: O(N)
+        # Compute global context from Memory: K.T @ V -> [B, Heads, D_head, D_head]
+        # This summarizes the ENTIRE memory bank into a small matrix
+        kv = torch.matmul(k.transpose(-2, -1), v)
         
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads, batch_first=True, norm_first=True, dropout=0.1
+        # Normalize Key Sum for stable attention (denominator)
+        z = 1.0 / (torch.matmul(q, k.sum(dim=-2, keepdim=True).transpose(-2, -1)) + 1e-6)
+        
+        # 4. Read from Memory: Q 
+        # Process tokens reading the aggregated memory
+        attn_out = torch.matmul(q, kv) * z
+        
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, N_q, D)
+        return self.out_proj(attn_out)
+
+class ViTTMBlock(nn.Module):
+    """
+    A single layer of the Vision Token Turing Machine.
+    1. Self-Attention (Process <-> Process)
+    2. Linear Cross-Attention (Process reads Memory)
+    3. MLP
+    """
+    def __init__(self, dim, num_heads, mlp_ratio=4., dropout=0.0):
+        super().__init__()
+        
+        # Standard Self-Attention for Process Tokens (Context sharing)
+        self.norm1 = nn.LayerNorm(dim)
+        self.self_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        
+        # Read Operation: Process tokens query the high-res Memory
+        self.norm2 = nn.LayerNorm(dim)
+        self.cross_attn = LinearCrossAttention(dim, num_heads=num_heads)
+        
+        # Feed Forward
+        self.norm3 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, int(dim * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(dim * mlp_ratio), dim),
+            nn.Dropout(dropout)
         )
-        self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        self.norm = nn.LayerNorm(embed_dim)
 
-    def random_masking(self, x, mask_ratio):
-        """ Standard MAE Masking """
-        N, L, D = x.shape
-        len_keep = int(L * (1 - mask_ratio))
-        noise = torch.rand(N, L, device=x.device)
-        ids_shuffle = torch.argsort(noise, dim=1)
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-        ids_keep = ids_shuffle[:, :len_keep]
-        x_keep = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+    def forward(self, x_process, x_memory):
+        # 1. Process Self-Interaction (Standard ViT part)
+        x_norm = self.norm1(x_process)
+        attn_out, _ = self.self_attn(x_norm, x_norm, x_norm)
+        x_process = x_process + attn_out
         
-        # Generate mask tokens and restore order
-        mask_tokens = self.mask_token.repeat(N, L - len_keep, 1)
-        x_masked = torch.cat([x_keep, mask_tokens], dim=1)
-        x_out = torch.gather(x_masked, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D))
+        # 2. Read from Memory (ViTTM specific)
+        x_norm = self.norm2(x_process)
+        read_out = self.cross_attn(x_query=x_norm, x_key_value=x_memory)
+        x_process = x_process + read_out
         
-        return x_out
-
-    def forward(self, x, mask_ratio=0.0):
-        x = self.patch_embed(x) # [B, D, 4, 4]
-        x = x.flatten(2).transpose(1, 2) # [B, 16, D]
-        x = x + self.pos_embed
+        # 3. MLP
+        x_process = x_process + self.mlp(self.norm3(x_process))
         
-        if mask_ratio > 0:
-            x = self.random_masking(x, mask_ratio)
-            
-        x = self.blocks(x)
-        x = self.norm(x)
-        return x
+        return x_process
 
 class ViTTM_HMR(nn.Module):
     def __init__(self, 
                  img_size=256, 
-                 embed_dim=384):
+                 memory_patch_size=16, 
+                 process_patch_size=64, 
+                 embed_dim=384, 
+                 depth=6, 
+                 num_heads=6):
         super().__init__()
         
-        # --- 1. MEMORY STREAM (Pre-trained Teacher) ---
-        # Use ResNet18 trained on ImageNet.
-        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        self.embed_dim = embed_dim
         
-        # Remove the FC layer and AvgPool to keep spatial grid
-        # ResNet18 structure: layer4 outputs 512 channels, downsample 32x
-        # 256px input / 32 = 8x8 grid.
-        self.memory_encoder = nn.Sequential(*list(resnet.children())[:-2])
-        self.teacher_dim = 512
+        # --- 1. TOKENIZATION ---
         
-        for param in self.memory_encoder.parameters():
-            param.requires_grad = False # FREEZE THE TEACHER
+        # Stream A: High-Res Memory Tokens (16x16 patches)
+        # 256 / 16 = 16x16 grid = 256 tokens (Large T)
+        self.memory_embed = nn.Conv2d(3, embed_dim, kernel_size=memory_patch_size, stride=memory_patch_size)
+        self.num_memory_tokens = (img_size // memory_patch_size) ** 2
+        
+        # Stream B: Low-Res Process Tokens (64x64 patches)
+        # 256 / 64 = 4x4 grid = 16 tokens 
+        self.process_embed = nn.Conv2d(3, embed_dim, kernel_size=process_patch_size, stride=process_patch_size)
+        self.num_process_tokens = (img_size // process_patch_size) ** 2
+        
+        # Positional Embeddings
+        self.memory_pos_embed = nn.Parameter(torch.zeros(1, self.num_memory_tokens, embed_dim))
+        self.process_pos_embed = nn.Parameter(torch.zeros(1, self.num_process_tokens, embed_dim))
+        self.process_mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
-        # --- 2. PROCESS STREAM (Trainable Student) ---
-        # Sees coarse context (Patch size 64 -> 16 tokens -> 4x4 grid)
-        self.process_encoder = ProcessEncoder(img_size=256, patch_size=64, embed_dim=embed_dim, depth=6)
+        # --- 2. ENCODER (The Turing Machine Controller) ---
+        self.blocks = nn.ModuleList([
+            ViTTMBlock(dim=embed_dim, num_heads=num_heads) for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(embed_dim)
 
-        # --- 3. PREDICTOR HEAD ---
-        # Task: Map Student (4x4, dim=384) -> Teacher (8x8, dim=512)
-        self.predictor = nn.Sequential(
-            # 1. Upsample 4x4 -> 8x8 (Stride 2)
-            nn.ConvTranspose2d(embed_dim, embed_dim, kernel_size=2, stride=2), 
+        # --- 3. PREDICTION HEAD (Decoder) ---
+        # Task: Reconstruct the High-Res Memory features from Low-Res Process tokens
+        # Upsample 4x4 (Process) back to 16x16 (Memory)
+        scale_factor = process_patch_size // memory_patch_size # 64/16 = 4
+        
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(embed_dim, embed_dim, kernel_size=scale_factor, stride=scale_factor),
+            nn.GroupNorm(32, embed_dim), # Normalization usually helps reconstruction
             nn.GELU(),
-            # 2. Project Dimensions 384 -> 512
-            nn.Conv2d(embed_dim, self.teacher_dim, kernel_size=1) 
+            nn.Conv2d(embed_dim, embed_dim, kernel_size=1)
         )
+        
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize pos_embeds
+        nn.init.trunc_normal_(self.memory_pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.process_pos_embed, std=0.02)
+        
+        # Initialize patches 
+        nn.init.kaiming_normal_(self.memory_embed.weight, mode='fan_out')
+        nn.init.kaiming_normal_(self.process_embed.weight, mode='fan_out')
+
+    def random_masking(self, x, mask_ratio):
+        """
+        Masks the Process Tokens (Low Res).
+        Returns: masked_x, mask_indices (binary mask not needed for reconstruction here)
+        """
+        N, L, D = x.shape
+        len_keep = int(L * (1 - mask_ratio))
+        
+        noise = torch.rand(N, L, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        
+        # Keep subset
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_keep = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        
+        # Add mask tokens
+        mask_tokens = self.process_mask_token.repeat(N, L - len_keep, 1)
+        x_masked = torch.cat([x_keep, mask_tokens], dim=1)
+        
+        # Unshuffle to restore order 
+        x_out = torch.gather(x_masked, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, D))
+        
+        return x_out
 
     def forward(self, process_view, memory_view, mask_ratio=0.75):
-        # 1. GENERATE TARGETS (Teacher)
+        """
+        process_view: [B, 3, 256, 256] (Same image, effectively)
+        memory_view:  [B, 3, 256, 256] (Same image)
+        """
+        
+        # 1. EMBED MEMORY (Stream A - High Res)
+        # [B, 3, 256, 256] -> [B, D, 16, 16] -> [B, 256, D]
+        mem_tokens = self.memory_embed(memory_view)
+        B, D, H_m, W_m = mem_tokens.shape
+        mem_tokens = mem_tokens.flatten(2).transpose(1, 2)
+        mem_tokens = mem_tokens + self.memory_pos_embed
+        
+        # Stop gradient on memory targets 
         with torch.no_grad():
-            # ResNet output: [B, 512, 8, 8]
-            target_map = self.memory_encoder(memory_view)
-            # Flatten to [B, 64, 512]
-            target_features = target_map.flatten(2).transpose(1, 2)
-            
-        # 2. ENCODE PROCESS (Student)
-        # Output: [B, 16, 384] (Standard Tokens)
-        latent_process = self.process_encoder(process_view, mask_ratio=mask_ratio)
+            target_features = mem_tokens.clone().detach()
+
+        # 2. EMBED PROCESS (Stream B - Low Res)
+        # [B, 3, 256, 256] -> [B, D, 4, 4] -> [B, 16, D]
+        proc_tokens = self.process_embed(process_view)
+        proc_tokens = proc_tokens.flatten(2).transpose(1, 2)
+        proc_tokens = proc_tokens + self.process_pos_embed
         
-        # 3. PREDICT TEACHER FROM STUDENT
-        # Reshape to grid: [B, 16, 384] -> [B, 384, 4, 4]
-        B, N, D = latent_process.shape
-        H_p = int(N**0.5) # Should be 4
-        latent_2d = latent_process.transpose(1, 2).reshape(B, D, H_p, H_p)
+        # 3. MASK PROCESS TOKENS
+        if mask_ratio > 0:
+            proc_tokens = self.random_masking(proc_tokens, mask_ratio)
+
+        # 4. ViTTM ENCODER (Read/Write Loop)
+        x = proc_tokens
+        for blk in self.blocks:
+            # Process tokens update themselves AND read from static Memory tokens
+            x = blk(x_process=x, x_memory=mem_tokens)
         
-        # Upsample & Project: [B, 384, 4, 4] -> [B, 512, 8, 8]
-        pred_map = self.predictor(latent_2d)
+        x = self.norm(x) # [B, 16, D]
+
+        # 5. RECONSTRUCT MEMORY (HMR Task)
+        # Reshape to grid for ConvTranspose: [B, 16, D] -> [B, D, 4, 4]
+        H_p = int(self.num_process_tokens ** 0.5)
+        x_2d = x.transpose(1, 2).reshape(B, D, H_p, H_p)
         
-        # Flatten: [B, 64, 512]
+        # Upsample: [B, D, 4, 4] -> [B, D, 16, 16]
+        pred_map = self.decoder(x_2d)
+        
+        # Flatten back: [B, 256, D]
         pred_features = pred_map.flatten(2).transpose(1, 2)
 
-        # 4. LOSS 
-        # Minimize Negative Cosine Sim
-        target_flat = target_features.reshape(-1, self.teacher_dim)
-        pred_flat = pred_features.reshape(-1, self.teacher_dim)
+        # 6. LOSS (Cosine Similarity)
+        target_flat = target_features.reshape(-1, D)
+        pred_flat = pred_features.reshape(-1, D)
         
         loss = -F.cosine_similarity(pred_flat, target_flat).mean()
-        
+
         return loss, pred_features, target_features
