@@ -52,12 +52,11 @@ class ViTTMBlock(nn.Module):
         self.norm_read = nn.LayerNorm(dim)
         self.read_attn = LinearCrossAttention(dim, num_heads=num_heads)
         
-        # 2. PROCESS COMPUTE (Standard Self-Attn)
+        # 2. PROCESS COMPUTE 
         self.norm_proc = nn.LayerNorm(dim)
         self.proc_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
         
         # 3. WRITE (Cross Attn: Query=Memory, KV=Process)
-        # This allows the Memory to be updated based on what the Process tokens found.
         self.norm_write = nn.LayerNorm(dim)
         self.write_attn = LinearCrossAttention(dim, num_heads=num_heads)
         
@@ -93,7 +92,6 @@ class ViTTMBlock(nn.Module):
         # --- C. WRITE PHASE ---
         # Memory updates itself based on Process tokens
         x_m_norm = self.norm_write(x_memory)
-        # Note: Query is Memory, KV is Process
         x_write = self.write_attn(x_query=x_m_norm, x_key_value=x_process) 
         x_memory = x_memory + x_write
         x_memory = x_memory + self.mlp_memory(self.norm_mlp_m(x_memory))
@@ -120,8 +118,7 @@ class ViTTM_HMR(nn.Module):
         self.num_process_tokens = (img_size // process_patch_size) ** 2
         
         # --- 2. MEMORY BANK ---
-        # Instead of using the Image as memory (Cheating), we use a Learned Latent Memory.
-        # This is the "Scratchpad" the Turing Machine uses.
+
         self.num_memory_slots = 256
         self.memory_bank = nn.Parameter(torch.randn(1, self.num_memory_slots, embed_dim) * 0.02)
         
@@ -165,7 +162,6 @@ class ViTTM_HMR(nn.Module):
 
     def forward(self, process_view, memory_view, mask_ratio=0.75):
         # 1. PREPARE TARGETS (High-Res)
-        # We do NOT pass these to the encoder. They are for LOSS only.
         with torch.no_grad():
             target_tokens = self.target_embed(memory_view)
             target_tokens = target_tokens.flatten(2).transpose(1, 2)
@@ -196,7 +192,6 @@ class ViTTM_HMR(nn.Module):
         pred_features = pred_map.flatten(2).transpose(1, 2)
 
         # 6. LOSS
-        # We try to match the High-Res Target using features distilled into the Low-Res Process tokens
         target_flat = target_tokens.reshape(-1, self.embed_dim)
         pred_flat = pred_features.reshape(-1, self.embed_dim)
         
