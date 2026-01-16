@@ -6,9 +6,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from torch.utils.data import DataLoader
 from torchvision import transforms
-# REMOVED: from torch.cuda.amp import GradScaler, autocast (Causing Instability)
 
-# Import your custom modules
 from dataloader import TCGA_HMR_Dataset
 from model import ViTTM_HMR
 
@@ -22,7 +20,6 @@ MANIFEST_FILE = "patches_subset_300.csv"
 SLIDE_DIR = "/scratch/jh1466/TCGA_BRCA_Slides"
 
 def train():
-    # Enable cuDNN Benchmarking for speed
     torch.backends.cudnn.benchmark = True
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
