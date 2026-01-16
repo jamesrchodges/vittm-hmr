@@ -12,13 +12,13 @@ import numpy as np
 from model import ViTTM_HMR
 
 # --- CONFIGURATION ---
-BATCH_SIZE = 64
+BATCH_SIZE = 128  
 LR_EVAL = 1e-3
 EPOCHS_EVAL = 5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 DATA_DIR = "/scratch/jh1466/camelyon/" 
-CHECKPOINT_PATH = "20260105_125821_results/checkpoint_epoch_50.pth"
+CHECKPOINT_PATH = "20260114_131710_results/checkpoint_epoch_10.pth" 
 
 class LinearProbe(nn.Module):
     def __init__(self, backbone, num_classes=2):
@@ -32,18 +32,29 @@ class LinearProbe(nn.Module):
         self.head = nn.Linear(384, num_classes)
 
     def forward(self, x):
-        # x is [B, 3, 256, 256]
-        # process_encoder returns [B, 16, 384]
-        features = self.backbone.process_encoder(x, mask_ratio=0.0) 
-        # Global Average Pooling -> [B, 384]
-        global_feat = features.mean(dim=1) 
+        # --- OPTION B INFERENCE LOGIC ---
+        
+        # 1. Embed Process Tokens (Student)
+        proc_tokens = self.backbone.process_embed(x)
+        proc_tokens = proc_tokens.flatten(2).transpose(1, 2)
+        proc_tokens = proc_tokens + self.backbone.process_pos_embed
+        
+        # 2. Initialize Latent Memory
+        B = proc_tokens.shape[0]
+        curr_memory = self.backbone.memory_bank.expand(B, -1, -1) 
+        
+        # 3. ViTTM Loop (Read -> Compute -> Write)
+        for blk in self.backbone.blocks:
+            proc_tokens, curr_memory = blk(x_process=proc_tokens, x_memory=curr_memory)
+            
+        # 4. Norm
+        features = self.backbone.norm(proc_tokens) # [B, 16, 384]
+        
+        # 5. Global Average Pooling -> Classification
+        global_feat = features.mean(dim=1) # [B, 384]
         return self.head(global_feat)
 
 class LocalPCamDataset(Dataset):
-    """
-    Custom Dataset to load manually downloaded PCam HDF5 files.
-    Expects files named: 'camelyonpatch_level_2_split_[split]_[x/y].h5'
-    """
     def __init__(self, root_dir, split='train', transform=None, limit=None):
         self.root_dir = root_dir
         self.split = split
@@ -53,11 +64,9 @@ class LocalPCamDataset(Dataset):
         self.x_path = os.path.join(root_dir, f'camelyonpatch_level_2_split_{split}_x.h5')
         self.y_path = os.path.join(root_dir, f'camelyonpatch_level_2_split_{split}_y.h5')
         
-        # Verify files exist
         if not os.path.exists(self.x_path) or not os.path.exists(self.y_path):
-            raise FileNotFoundError(f"Could not find HDF5 files in {root_dir}. Expected: {os.path.basename(self.x_path)}")
+            raise FileNotFoundError(f"Could not find HDF5 files in {root_dir}.")
 
-        # Open to get length, then close
         with h5py.File(self.x_path, 'r') as f:
             self.total_len = f['x'].shape[0]
             
@@ -74,11 +83,9 @@ class LocalPCamDataset(Dataset):
             self.x_file = h5py.File(self.x_path, 'r')
             self.y_file = h5py.File(self.y_path, 'r')
             
-        # Read data
-        img_arr = self.x_file['x'][idx] # Shape: (96, 96, 3)
-        label_arr = self.y_file['y'][idx] # Shape: (1, 1)
+        img_arr = self.x_file['x'][idx]
+        label_arr = self.y_file['y'][idx]
         
-        # Convert to PIL for standard transforms
         image = Image.fromarray(img_arr)
         label = int(label_arr.flatten()[0])
         
@@ -88,11 +95,12 @@ class LocalPCamDataset(Dataset):
         return image, label
 
 def evaluate_pcam():
-    print(f"--- Starting Linear Probe on Manual Local PCam ---")
-    print(f"Data Directory: {DATA_DIR}")
+    torch.backends.cudnn.benchmark = True
+    
+    print(f"--- Starting Linear Probe (FP32 Safe Mode) ---")
+    print(f"Batch Size: {BATCH_SIZE}")
     
     # 1. Prepare Data
-    # PCam is 96x96. Resize to 256x256 to match ViTTM
     transform = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.ToTensor(),
@@ -100,19 +108,16 @@ def evaluate_pcam():
     ])
     
     try:
-        # Limit training to 5000 samples
         print("Initializing Train Dataset...")
         train_set = LocalPCamDataset(root_dir=DATA_DIR, split='train', transform=transform, limit=5000)
-        
         print("Initializing Test Dataset...")
         test_set = LocalPCamDataset(root_dir=DATA_DIR, split='test', transform=transform, limit=1000)
-        
     except Exception as e:
         print(f"\nCRITICAL ERROR: {e}")
         return
 
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
+    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True)
     
     # 2. Load Model
     print(f"Loading backbone from: {CHECKPOINT_PATH}")
@@ -122,7 +127,7 @@ def evaluate_pcam():
         state_dict = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
         backbone.load_state_dict(state_dict)
     except Exception as e:
-        print(f"Loading state dict: {e}")
+        print(f"Loading state dict error: {e}")
         print("Attempting strict=False...")
         backbone.load_state_dict(state_dict, strict=False)
     
@@ -139,11 +144,16 @@ def evaluate_pcam():
         total = 0
         
         for images, targets in train_loader:
-            images, targets = images.to(DEVICE), targets.to(DEVICE)
+            # Load data
+            images, targets = images.to(DEVICE, non_blocking=True), targets.to(DEVICE, non_blocking=True)
             
             optimizer.zero_grad()
+            
+            # Forward Pass 
             outputs = model(images)
             loss = criterion(outputs, targets)
+            
+            # Backward Pass 
             loss.backward()
             optimizer.step()
             
@@ -162,7 +172,7 @@ def evaluate_pcam():
     
     with torch.no_grad():
         for images, targets in test_loader:
-            images, targets = images.to(DEVICE), targets.to(DEVICE)
+            images, targets = images.to(DEVICE, non_blocking=True), targets.to(DEVICE, non_blocking=True)
             
             outputs = model(images)
             _, predicted = torch.max(outputs.data, 1)
@@ -174,7 +184,7 @@ def evaluate_pcam():
     print(f"--- Final PCam Accuracy: {acc*100:.2f}% ---")
     
     if acc > 0.65:
-        print("SUCCESS")
+        print("SUCCESS: The Latent Memory features are valid!")
     elif acc > 0.55:
         print("WEAK SIGNAL")
     else:
