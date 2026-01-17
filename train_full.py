@@ -2,107 +2,124 @@ import os
 import torch
 import torch.optim as optim
 import pandas as pd
+import matplotlib.pyplot as plt
 from datetime import datetime
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast # For Mixed Precision
-import time
+from torchvision import transforms
 
-# Custom Modules
 from dataloader import TCGA_HMR_Dataset
 from model import ViTTM_HMR
 
 # --- CONFIGURATION ---
-MANIFEST_FILE = "full_tcga_manifest.csv" # The new large file
-SLIDE_DIR = "/scratch/jh1466/TCGA_BRCA_Slides"
-RESULTS_DIR = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_FULL_RUN"
-
 BATCH_SIZE = 64        
-LEARNING_RATE = 1.5e-4 
+LEARNING_RATE = 1e-4   
 EPOCHS = 20            
-MASK_RATIO = 0.75
+MASK_RATIO = 0.75      
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-NUM_WORKERS = 16     
+
+MANIFEST_FILE = "full_tcga_manifest.csv"  
+SLIDE_DIR = "/scratch/jh1466/TCGA_BRCA_Slides" 
 
 def train():
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    print(f"--- STARTING FULL TRAINING RUN ---")
-    print(f"Output Directory: {RESULTS_DIR}")
+    # Optimization: Use CuDNN Benchmark for speed
+    torch.backends.cudnn.benchmark = True
     
-    # 1. Dataset
-    print("Loading Manifest...")
-    dataset = TCGA_HMR_Dataset(
-        manifest_file=MANIFEST_FILE, 
-        slide_dir=SLIDE_DIR, 
-        transform=None
-    )
-    print(f"Total Patches: {len(dataset)}")
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    results_dir = f"{timestamp}_FULL_RUN"
+    os.makedirs(results_dir, exist_ok=True)
+    
+    print(f"--- STARTING FULL RUN (3,000 Slides) ---")
+    print(f"--- Architecture: ViTTM-HMR ---")
+    print(f"--- Device: {DEVICE} | Batch: {BATCH_SIZE} ---")
+    
+    print("Loading Full Manifest...")
+    try:
+        dataset = TCGA_HMR_Dataset(
+            manifest_file=MANIFEST_FILE, 
+            slide_dir=SLIDE_DIR, 
+            transform=None, 
+            use_dummy_data=False
+        )
+        print(f"Total Training Patches: {len(dataset)}")
+    except FileNotFoundError:
+        print(f"CRITICAL ERROR: Could not find {MANIFEST_FILE}.")
+        print("Please run the 'create_full_dataset_parallel.py' script first.")
+        return
     
     dataloader = DataLoader(
         dataset, batch_size=BATCH_SIZE, shuffle=True, 
-        num_workers=NUM_WORKERS, pin_memory=True, prefetch_factor=2
+        num_workers=8, 
+        pin_memory=True, 
+        persistent_workers=True, 
+        prefetch_factor=2
     )
     
-    # 2. Model
+    # 2. Initialize Model
     model = ViTTM_HMR().to(DEVICE)
+    
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
                             lr=LEARNING_RATE, weight_decay=0.05)
     
-    # Scheduler: Linear warmup for 1 epoch, then Cosine decay
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=LEARNING_RATE, steps_per_epoch=len(dataloader), epochs=EPOCHS
-    )
+    # Cosine Scheduler for smooth convergence over long runs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     
-    # Mixed Precision Scaler
-    scaler = GradScaler()
-
-    # 3. Loop
+    loss_history = []
+    
+    # 3. Production Training Loop
     for epoch in range(EPOCHS):
         model.train()
         epoch_loss = 0
-        start_time = time.time()
+        start_time = datetime.now()
+        
+        print(f"--- Epoch {epoch+1}/{EPOCHS} Started at {start_time.strftime('%H:%M:%S')} ---")
         
         for i, batch in enumerate(dataloader):
-            process_view = batch['process_view'].to(DEVICE)
-            memory_view = batch['memory_view'].to(DEVICE)
+            # Load Data (Non-blocking for speed)
+            memory_view = batch['memory_view'].to(DEVICE, non_blocking=True)
+            process_view = batch['process_view'].to(DEVICE, non_blocking=True)
             
             optimizer.zero_grad()
             
-            # Mixed Precision Context
-            with autocast():
-                loss, _, _ = model(process_view, memory_view, mask_ratio=MASK_RATIO)
+            # Forward Pass 
+            loss, pred_features, target_features = model(process_view, memory_view, mask_ratio=MASK_RATIO)
             
-            # Scaled Backward Pass
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
+            # Backward Pass
+            loss.backward()
+            
+            # Gradient Clipping 
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
             
             epoch_loss += loss.item()
             
-            # Logging (Every 100 steps)
+            # Log every 100 steps 
             if i % 100 == 0:
-                print(f"Ep {epoch+1} | Step {i}/{len(dataloader)} | Loss: {loss.item():.4f}")
-                
-                # Append to log file immediately (safe against crashes)
-                with open(os.path.join(RESULTS_DIR, "train_log.csv"), "a") as f:
-                    f.write(f"{epoch+1},{i},{loss.item()}\n")
+                display_loss = 1.0 + loss.item()
+                print(f"Ep {epoch+1} | Step {i}/{len(dataloader)} | Loss: {loss.item():.4f} (Dist: {display_loss:.4f})")
+                loss_history.append({'epoch': epoch+1, 'step': i, 'loss': loss.item()})
 
         # End of Epoch Stats
-        duration = (time.time() - start_time) / 60
+        scheduler.step()
         avg_loss = epoch_loss / len(dataloader)
-        print(f"=== EPOCH {epoch+1} COMPLETE | Avg Loss: {avg_loss:.4f} | Time: {duration:.1f} min ===")
+        duration = datetime.now() - start_time
         
-        # Save Checkpoint
+        print(f"=== EPOCH {epoch+1} COMPLETE | Avg Loss: {avg_loss:.4f} | Time: {duration} ===")
+        
+        # Save Checkpoint Every Epoch 
+        save_path = os.path.join(results_dir, f"checkpoint_epoch_{epoch+1}.pth")
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': avg_loss,
-        }, os.path.join(RESULTS_DIR, f"checkpoint_epoch_{epoch+1}.pth"))
+        }, save_path)
+        print(f"Checkpoint saved: {save_path}")
+        
+        # Save CSV log incrementally
+        pd.DataFrame(loss_history).to_csv(os.path.join(results_dir, "training_log.csv"), index=False)
+
+    print("FULL TRAINING RUN COMPLETE.")
 
 if __name__ == "__main__":
-    # Initialize Log File
-    with open(os.path.join(RESULTS_DIR, "train_log.csv"), "w") as f:
-        f.write("Epoch,Step,Loss\n")
-        
     train()
