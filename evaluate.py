@@ -32,7 +32,6 @@ class LinearProbe(nn.Module):
         self.head = nn.Linear(384, num_classes)
 
     def forward(self, x):
-        # --- OPTION B INFERENCE LOGIC ---
         
         # 1. Embed Process Tokens (Student)
         proc_tokens = self.backbone.process_embed(x)
@@ -124,12 +123,23 @@ def evaluate_pcam():
     backbone = ViTTM_HMR().to(DEVICE)
     
     try:
-        state_dict = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        checkpoint = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+            print("Detected Production Checkpoint (Dictionary format).")
+        else:
+            state_dict = checkpoint
+            print("Detected Subset Checkpoint (Raw Weights format).")
+            
         backbone.load_state_dict(state_dict)
+        print("Weights loaded successfully.")
+        
     except Exception as e:
         print(f"Loading state dict error: {e}")
-        print("Attempting strict=False...")
+        print("Attempting strict=False (legacy mode)...")
         backbone.load_state_dict(state_dict, strict=False)
+    
     
     model = LinearProbe(backbone).to(DEVICE)
     optimizer = optim.Adam(model.head.parameters(), lr=LR_EVAL)
