@@ -46,8 +46,8 @@ class TCGA_HMR_Dataset(Dataset):
             self.has_filepath = True
             
         self.slide_cache = {}
-        # Max slides to keep open per worker to prevent OOM
-        self.CACHE_SIZE = 50 
+        # Max slides to keep open per worker 
+        self.CACHE_SIZE = 20
 
     def _get_slide_handle(self, slide_path):
         # 1. Cache Hit
