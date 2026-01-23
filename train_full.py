@@ -51,7 +51,8 @@ def train():
         num_workers=8, 
         pin_memory=True, 
         persistent_workers=True, 
-        prefetch_factor=2
+        prefetch_factor=2,
+        timeout=300
     )
     
     # 2. Initialize Model
@@ -92,6 +93,18 @@ def train():
             optimizer.step()
             
             epoch_loss += loss.item()
+
+            # Saves progress every ~45 minutes (approx 5000 steps)
+            if i > 0 and i % 5000 == 0:
+                print(f"Saving safety checkpoint at step {i}...")
+                safety_path = os.path.join(results_dir, "checkpoint_latest_safety.pth")
+                torch.save({
+                    'epoch': epoch,
+                    'step': i,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': loss.item(),
+                }, safety_path)
             
             # Log every 100 steps 
             if i % 100 == 0:
